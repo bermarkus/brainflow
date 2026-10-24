@@ -349,10 +349,15 @@ BrainFlowBoards::BrainFlowBoards()
         {"timestamp_channel", 33},
         {"marker_channel", 34},
         {"package_num_channel", 0},
-        {"num_rows", 35},
+        {"num_rows", 44},
         {"eeg_channels", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}},
         {"emg_channels", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}},
-        {"ecg_channels", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}}
+        {"ecg_channels", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}},
+        // Filled from extended (121-byte) frames, 0 for classic ones. PPG red, IR, green in raw
+        // counts; then PPG counter, sync pulse counter, ping ID, pulse offset (us after the
+        // frame's DRDY), flags, board ID (the board's 48-bit USB serial number)
+        {"ppg_channels", {35, 36, 37}},
+        {"other_channels", {38, 39, 40, 41, 42, 43}}
     };
     brainflow_boards_json["boards"]["18"]["default"] =
     {

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <math.h>
 #include <string.h>
 #include <vector>
@@ -10,6 +11,8 @@
 
 constexpr int FreeEEG::start_byte;
 constexpr int FreeEEG::end_byte;
+constexpr int FreeEEG::classic_size;
+constexpr int FreeEEG::extended_size;
 constexpr double FreeEEG::ads_gain;
 constexpr double FreeEEG::ads_vref;
 
@@ -20,9 +23,11 @@ FreeEEG::FreeEEG (int board_id, struct BrainFlowInputParams params) : Board (boa
     is_streaming = false;
     keep_alive = false;
     initialized = false;
+    exact_frame_length = false;
     if (board_id == (int)BoardIds::FREEEEG32_BOARD)
     {
         min_package_size = 1 + 32 * 3;
+        exact_frame_length = true;
     }
     if (board_id == (int)BoardIds::FREEEEG128_BOARD)
     {
@@ -141,8 +146,17 @@ void FreeEEG::read_thread ()
         package[i] = 0.0;
     }
     bool first_package_received = false;
+    int learned_size = 0; // FreeEEG32: size of the last frame, for firmware with other sizes
+    int resyncs = 0;
 
     std::vector<int> eeg_channels = board_descr["default"]["eeg_channels"];
+    std::vector<int> ppg_channels;
+    std::vector<int> other_channels;
+    if (exact_frame_length)
+    {
+        ppg_channels = board_descr["default"]["ppg_channels"].get<std::vector<int>> ();
+        other_channels = board_descr["default"]["other_channels"].get<std::vector<int>> ();
+    }
 
     while (keep_alive)
     {
@@ -151,14 +165,27 @@ void FreeEEG::read_thread ()
         while ((keep_alive) && (pos < max_size - 2))
         {
             res = serial->read_from_serial_port (b + pos, 1);
+            if (res < 1)
+            {
+                continue; // timeout or error: no new byte at b[pos]
+            }
             int prev_id = (pos <= 0) ? 0 : pos - 1;
             if ((b[pos] == FreeEEG::start_byte) && (b[prev_id] == FreeEEG::end_byte) &&
-                (pos >= min_package_size))
+                is_frame_end (pos, learned_size, first_package_received))
             {
                 complete_package = true;
                 break;
             }
             pos += res;
+            // FreeEEG32: no frame ended where one had to, so the frame boundaries are lost;
+            // start over at the next 0xC0 0xA0 pair
+            if (exact_frame_length && first_package_received &&
+                pos > std::max (FreeEEG::extended_size, learned_size))
+            {
+                first_package_received = false;
+                resyncs++;
+                safe_logger (spdlog::level::warn, "FreeEEG32 frame sync lost, resync {}", resyncs);
+            }
         }
         if (complete_package)
         {
@@ -168,10 +195,36 @@ void FreeEEG::read_thread ()
                 first_package_received = true;
                 continue;
             }
+            learned_size = pos;
             package[board_descr["default"]["package_num_channel"].get<int> ()] = (double)b[0];
             for (unsigned int i = 0; i < eeg_channels.size (); i++)
             {
                 package[eeg_channels[i]] = (double)eeg_scale * cast_24bit_to_int32 (b + 1 + 3 * i);
+            }
+            if (exact_frame_length)
+            {
+                // Extended frames, offsets counted after the header: 97-102 board ID (48 bit),
+                // 103-111 latest PPG red/IR/green (24 bit), 112 PPG counter, 113 sync pulse
+                // counter, 114-115 ping ID, 116-117 pulse offset in us after DRDY, 118 flags.
+                // All big-endian, unsigned. Classic frames carry none of it: rows stay 0.
+                bool extended = (pos == FreeEEG::extended_size);
+                for (int i = 0; i < 3; i++)
+                {
+                    const unsigned char *v = b + 103 + 3 * i;
+                    package[ppg_channels[i]] =
+                        extended ? (double)((v[0] << 16) | (v[1] << 8) | v[2]) : 0.0;
+                }
+                double board_id = 0.0;
+                for (int i = 0; i < 6; i++)
+                {
+                    board_id = board_id * 256.0 + b[97 + i];
+                }
+                package[other_channels[0]] = extended ? (double)b[112] : 0.0;
+                package[other_channels[1]] = extended ? (double)b[113] : 0.0;
+                package[other_channels[2]] = extended ? (double)((b[114] << 8) | b[115]) : 0.0;
+                package[other_channels[3]] = extended ? (double)((b[116] << 8) | b[117]) : 0.0;
+                package[other_channels[4]] = extended ? (double)b[118] : 0.0;
+                package[other_channels[5]] = extended ? board_id : 0.0;
             }
             package[board_descr["default"]["timestamp_channel"].get<int> ()] = get_timestamp ();
             push_package (package);
@@ -183,6 +236,28 @@ void FreeEEG::read_thread ()
         }
     }
     delete[] package;
+}
+
+// Where a frame may end, given that b[pos] is 0xA0 and b[pos - 1] is 0xC0.
+bool FreeEEG::is_frame_end (int pos, int learned_size, bool synced) const
+{
+    if (!exact_frame_length)
+    {
+        return pos >= min_package_size;
+    }
+    // Before the first frame boundary any pair will do; a wrong one is caught when the next
+    // frame doesn't end at a known size.
+    if (!synced)
+    {
+        return pos >= 1;
+    }
+    if ((pos == FreeEEG::classic_size) || (pos == FreeEEG::extended_size) ||
+        ((learned_size > 0) && (pos == learned_size)))
+    {
+        return true;
+    }
+    // firmware with another frame size: take the first frame after sync, then hold its size
+    return (learned_size == 0) && (pos >= min_package_size);
 }
 
 int FreeEEG::open_port ()
