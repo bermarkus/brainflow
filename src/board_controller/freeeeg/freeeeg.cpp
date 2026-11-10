@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 #include <vector>
 
@@ -12,7 +13,10 @@
 constexpr int FreeEEG::start_byte;
 constexpr int FreeEEG::end_byte;
 constexpr int FreeEEG::classic_size;
+constexpr int FreeEEG::extended_ppg_size;
 constexpr int FreeEEG::extended_size;
+constexpr double FreeEEG::accel_scale;
+constexpr double FreeEEG::gyro_scale;
 constexpr double FreeEEG::ads_gain;
 constexpr double FreeEEG::ads_vref;
 
@@ -147,15 +151,20 @@ void FreeEEG::read_thread ()
     }
     bool first_package_received = false;
     int learned_size = 0; // FreeEEG32: size of the last frame, for firmware with other sizes
+    int extended_seen = 0; // FreeEEG32: the extended size this firmware sends, once seen
     int resyncs = 0;
 
     std::vector<int> eeg_channels = board_descr["default"]["eeg_channels"];
     std::vector<int> ppg_channels;
     std::vector<int> other_channels;
+    std::vector<int> accel_channels;
+    std::vector<int> gyro_channels;
     if (exact_frame_length)
     {
         ppg_channels = board_descr["default"]["ppg_channels"].get<std::vector<int>> ();
         other_channels = board_descr["default"]["other_channels"].get<std::vector<int>> ();
+        accel_channels = board_descr["default"]["accel_channels"].get<std::vector<int>> ();
+        gyro_channels = board_descr["default"]["gyro_channels"].get<std::vector<int>> ();
     }
 
     while (keep_alive)
@@ -171,7 +180,7 @@ void FreeEEG::read_thread ()
             }
             int prev_id = (pos <= 0) ? 0 : pos - 1;
             if ((b[pos] == FreeEEG::start_byte) && (b[prev_id] == FreeEEG::end_byte) &&
-                is_frame_end (pos, learned_size, first_package_received))
+                is_frame_end (pos, learned_size, extended_seen, first_package_received))
             {
                 complete_package = true;
                 break;
@@ -183,6 +192,7 @@ void FreeEEG::read_thread ()
                 pos > std::max (FreeEEG::extended_size, learned_size))
             {
                 first_package_received = false;
+                extended_seen = 0;
                 resyncs++;
                 safe_logger (spdlog::level::warn, "FreeEEG32 frame sync lost, resync {}", resyncs);
             }
@@ -196,6 +206,10 @@ void FreeEEG::read_thread ()
                 continue;
             }
             learned_size = pos;
+            if ((pos == FreeEEG::extended_ppg_size) || (pos == FreeEEG::extended_size))
+            {
+                extended_seen = pos;
+            }
             package[board_descr["default"]["package_num_channel"].get<int> ()] = (double)b[0];
             for (unsigned int i = 0; i < eeg_channels.size (); i++)
             {
@@ -205,9 +219,24 @@ void FreeEEG::read_thread ()
             {
                 // Extended frames, offsets counted after the header: 97-102 board ID (48 bit),
                 // 103-111 latest PPG red/IR/green (24 bit), 112 PPG counter, 113 sync pulse
-                // counter, 114-115 ping ID, 116-117 pulse offset in us after DRDY, 118 flags.
-                // All big-endian, unsigned. Classic frames carry none of it: rows stay 0.
-                bool extended = (pos == FreeEEG::extended_size);
+                // counter, 114-115 ping ID, 116-117 pulse offset in us after DRDY, 118 flags
+                // (bit 5 motion stale). All big-endian, unsigned. 134-byte frames add 119-124
+                // accel X/Y/Z, 125-130 gyro X/Y/Z (signed 16 bit, big-endian), 131 motion
+                // counter. Classic frames carry none of it: rows stay 0, as do the motion rows
+                // for 121-byte frames.
+                bool extended =
+                    (pos == FreeEEG::extended_ppg_size) || (pos == FreeEEG::extended_size);
+                bool motion = (pos == FreeEEG::extended_size);
+                for (int i = 0; i < 3; i++)
+                {
+                    package[accel_channels[i]] = motion
+                        ? FreeEEG::accel_scale * (int16_t)((b[119 + 2 * i] << 8) | b[120 + 2 * i])
+                        : 0.0;
+                    package[gyro_channels[i]] = motion
+                        ? FreeEEG::gyro_scale * (int16_t)((b[125 + 2 * i] << 8) | b[126 + 2 * i])
+                        : 0.0;
+                }
+                package[other_channels[6]] = motion ? (double)b[131] : 0.0;
                 for (int i = 0; i < 3; i++)
                 {
                     const unsigned char *v = b + 103 + 3 * i;
@@ -239,7 +268,7 @@ void FreeEEG::read_thread ()
 }
 
 // Where a frame may end, given that b[pos] is 0xA0 and b[pos - 1] is 0xC0.
-bool FreeEEG::is_frame_end (int pos, int learned_size, bool synced) const
+bool FreeEEG::is_frame_end (int pos, int learned_size, int extended_seen, bool synced) const
 {
     if (!exact_frame_length)
     {
@@ -251,8 +280,18 @@ bool FreeEEG::is_frame_end (int pos, int learned_size, bool synced) const
     {
         return pos >= 1;
     }
-    if ((pos == FreeEEG::classic_size) || (pos == FreeEEG::extended_size) ||
-        ((learned_size > 0) && (pos == learned_size)))
+    // Firmware sends classic frames and one extended size (121 bytes before the motion sensor,
+    // 134 since). Once one extended size was seen only that one counts: in a 134-byte frame
+    // accel X = 0xC0A0 puts a pair where a 121-byte frame ends.
+    if (pos == FreeEEG::classic_size)
+    {
+        return true;
+    }
+    if ((pos == FreeEEG::extended_ppg_size) || (pos == FreeEEG::extended_size))
+    {
+        return (extended_seen == 0) || (pos == extended_seen);
+    }
+    if ((learned_size > 0) && (pos == learned_size))
     {
         return true;
     }

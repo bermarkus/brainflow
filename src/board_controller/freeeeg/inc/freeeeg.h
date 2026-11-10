@@ -26,7 +26,7 @@ protected:
     int open_port ();
     int set_port_settings ();
     void read_thread ();
-    bool is_frame_end (int pos, int learned_size, bool synced) const;
+    bool is_frame_end (int pos, int learned_size, int extended_seen, bool synced) const;
 
 public:
     FreeEEG (int board_id, struct BrainFlowInputParams params);
@@ -43,8 +43,14 @@ public:
     // FreeEEG32 frame sizes counted after the 0xA0 header: sequence number, 32 x 24-bit EEG,
     // 6 aux bytes, 0xC0 (105-byte frames), and extended frames with 16 more aux bytes before
     // the 0xC0: PPG red/IR/green, PPG counter, sync pulse counter, ping ID, pulse offset, flags
+    // (121-byte frames, firmware before the motion sensor). Current firmware adds 13 more:
+    // accel X/Y/Z, gyro X/Y/Z (16-bit each), motion counter (134-byte frames).
     static constexpr int classic_size = 1 + 32 * 3 + 6 + 1;
-    static constexpr int extended_size = classic_size + 16;
+    static constexpr int extended_ppg_size = classic_size + 16;
+    static constexpr int extended_size = extended_ppg_size + 13;
+    // LSM6DSOX at +-4 g and +-500 dps: 0.122 mg and 17.5 mdps per count
+    static constexpr double accel_scale = 0.122e-3;
+    static constexpr double gyro_scale = 17.5e-3;
     static constexpr double ads_gain = 8.0;
     static constexpr double ads_vref = 2.5;
 };
